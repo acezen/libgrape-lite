@@ -60,20 +60,27 @@ class KafkaConsumer {
                                    {"auto.offset.reset", "earliest"}};
     qmq_.resize(partition_num);
     emq_.resize(partition_num);
+    smq_.resize(partition_num);
     for (int i = 0; i < partition_num; ++i) {
       consumer_ptrs_[i] = std::make_shared<Consumer>(configuration);
       TopicPartitionList ps = {TopicPartition(topic_, i)};
       consumer_ptrs_[i]->assign(ps);
 
       consumer_ptrs_[i]->subscribe({topic_});
+      std::chrono::milliseconds time_out(5000);
+      consumer_ptrs_[i]->set_timeout(time_out);
       qmq_[i] =
           std::make_shared<grape::BlockingQueue<std::vector<std::string>>>();
       emq_[i] =
           std::make_shared<grape::BlockingQueue<std::vector<std::string>>>();
+      smq_[i] =
+          std::make_shared<grape::BlockingQueue<bool>>();
       qmq_[i]->SetLimit(16);
       emq_[i]->SetLimit(16);
+      smq_[i]->SetLimit(16);
       qmq_[i]->SetProducerNum(1);
       emq_[i]->SetProducerNum(1);
+      smq_[i]->SetProducerNum(1);
     }
 
     startFetch();
@@ -81,45 +88,62 @@ class KafkaConsumer {
 
   ~KafkaConsumer() = default;
 
-  /** Fetch stream data from the topic given when init
-   *  at the specified offset.
-   */
-  void ConsumeMessages(std::vector<std::string>& query_messages,
+  void Stop() {
+    for (auto &thread : consume_threads_) {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+  }
+
+  bool ConsumeMessages(std::vector<std::string>& query_messages,
                        std::vector<std::string>& edge_messages) {
+    bool time_to_terminate = false;
     for (int i = 0; i < partition_num_; ++i) {
       std::vector<std::string> qs, es;
+      bool flag;
       qmq_[i]->Get(qs);
       emq_[i]->Get(es);
+      smq_[i]->Get(flag);
       std::copy(qs.begin(), qs.end(), std::back_inserter(query_messages));
       std::copy(es.begin(), es.end(), std::back_inserter(edge_messages));
+      if (flag) {
+        time_to_terminate = true;
+      }
     }
     if (!query_messages.empty() || !edge_messages.empty()) {
       LOG(INFO) << "consumed " << query_messages.size() << " query messages, "
                 << edge_messages.size() << " edge messages.";
     }
+    return time_to_terminate;
   }
 
   inline std::string topic() { return topic_; }
 
  private:
   void startFetch() {
+    consume_threads_.resize(partition_num_);
     for (int i = 0; i < partition_num_; ++i) {
-      std::thread t = std::thread([&, i] {
+      consume_threads_[i] = std::thread([&, i] {
         while (true) {
           std::vector<std::string> qs, es;
-          fetchBatch(i, qs, es);
+          bool terminate = fetchBatch(i, qs, es);
           qmq_[i]->Put(std::move(qs));
           emq_[i]->Put(std::move(es));
+          smq_[i]->Put(terminate);
+          if (terminate) break;
         }
+        LOG(INFO) << "end thread.";
       });
-      t.detach();
+      // consume_threads_[i].detach();
       VLOG(1) << "[proc" << worker_id_ << "] start fetch thread on partition "
               << i;
     }
   }
 
-  void fetchBatch(int partition, std::vector<std::string>& query_messages,
+  bool fetchBatch(int partition, std::vector<std::string>& query_messages,
                   std::vector<std::string>& edge_messages) {
+    bool terminate_flag = false;
     edge_messages.reserve(batch_size_per_partition_);
     // Create a consumer dispatcher
     auto consumer_ptr_ = consumer_ptrs_[partition];
@@ -157,17 +181,27 @@ class KafkaConsumer {
           // Error process
           LOG(INFO) << "[+] Received error notification: " << error;
         },
-        [](ConsumerDispatcher::EndOfFile,
+        [&](ConsumerDispatcher::EndOfFile,
            const TopicPartition& topic_partition) {
           // EndOfFile process
+          dispatcher.stop();
+          // terminate_flag = true;
           LOG(INFO) << "Reached EOF on partition " << topic_partition;
+        },
+        [&](ConsumerDispatcher::Timeout) {
+          dispatcher.stop();
+          terminate_flag = true;
+          LOG(INFO) << "Consume time out.";
         });
+    return terminate_flag;
   }
 
   template <typename T>
-  using mq_t = std::shared_ptr<grape::BlockingQueue<std::vector<T>>>;
-  std::vector<mq_t<std::string>> qmq_;
-  std::vector<mq_t<std::string>> emq_;
+  using mq_t = std::shared_ptr<grape::BlockingQueue<T>>;
+  std::vector<mq_t<std::vector<std::string>>> qmq_;
+  std::vector<mq_t<std::vector<std::string>>> emq_;
+  std::vector<mq_t<bool>> smq_;
+  std::vector<std::thread> consume_threads_;
 
   int worker_id_;
 

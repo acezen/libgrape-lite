@@ -103,13 +103,20 @@ int main(int argc, char* argv[]) {
           FLAGS_batch_size));
     }
     while (true) {
+      bool to_terminate = false;
       query_vertices.clear();
       edge_msgs.clear();
       if (is_coordinator) {
-        consumer->ConsumeMessages(query_vertices, edge_msgs);
+        to_terminate = consumer->ConsumeMessages(query_vertices, edge_msgs);
+        if (to_terminate) {
+          consumer->Stop();
+        }
         grape::BcastSend(query_vertices, comm_spec.comm());
+        grape::BcastSend(to_terminate, comm_spec.comm());
       } else {
         grape::BcastRecv(query_vertices, comm_spec.comm(),
+                         grape::kCoordinatorRank);
+        grape::BcastRecv(to_terminate, comm_spec.comm(),
                          grape::kCoordinatorRank);
       }
 
@@ -136,6 +143,14 @@ int main(int argc, char* argv[]) {
               }));
         }
       }
+      if (to_terminate) {
+        LOG(INFO) << "time to terminate.";
+        break;
+      }
+    }
+    if (job != nullptr && job->joinable()) {
+      job->join();
+      job.reset(nullptr);
     }
     ostream.close();
   } else {
