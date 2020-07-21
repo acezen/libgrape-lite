@@ -60,7 +60,7 @@ class KafkaConsumer {
                                    {"auto.offset.reset", "earliest"}};
     qmq_.resize(partition_num);
     emq_.resize(partition_num);
-    smq_.resize(partition_num);
+    terminates_.resize(partition_num_, false);
     for (int i = 0; i < partition_num; ++i) {
       consumer_ptrs_[i] = std::make_shared<Consumer>(configuration);
       TopicPartitionList ps = {TopicPartition(topic_, i)};
@@ -73,16 +73,11 @@ class KafkaConsumer {
           std::make_shared<grape::BlockingQueue<std::vector<std::string>>>();
       emq_[i] =
           std::make_shared<grape::BlockingQueue<std::vector<std::string>>>();
-      smq_[i] =
-          std::make_shared<grape::BlockingQueue<bool>>();
       qmq_[i]->SetLimit(16);
       emq_[i]->SetLimit(16);
-      smq_[i]->SetLimit(16);
       qmq_[i]->SetProducerNum(1);
       emq_[i]->SetProducerNum(1);
-      smq_[i]->SetProducerNum(1);
     }
-
     startFetch();
   }
 
@@ -98,18 +93,14 @@ class KafkaConsumer {
 
   bool ConsumeMessages(std::vector<std::string>& query_messages,
                        std::vector<std::string>& edge_messages) {
-    bool time_to_terminate = false;
+    bool time_to_terminate = true;
     for (int i = 0; i < partition_num_; ++i) {
       std::vector<std::string> qs, es;
-      bool flag;
       qmq_[i]->Get(qs);
       emq_[i]->Get(es);
-      smq_[i]->Get(flag);
+      if (!terminates_[i]) time_to_terminate = false;
       std::copy(qs.begin(), qs.end(), std::back_inserter(query_messages));
       std::copy(es.begin(), es.end(), std::back_inserter(edge_messages));
-      if (flag) {
-        time_to_terminate = true;
-      }
     }
     if (!query_messages.empty() || !edge_messages.empty()) {
       LOG(INFO) << "consumed " << query_messages.size() << " query messages, "
@@ -127,11 +118,10 @@ class KafkaConsumer {
       consume_threads_[i] = std::thread([&, i] {
         while (true) {
           std::vector<std::string> qs, es;
-          bool terminate = fetchBatch(i, qs, es);
+          fetchBatch(i, qs, es);
           qmq_[i]->Put(std::move(qs));
           emq_[i]->Put(std::move(es));
-          smq_[i]->Put(terminate);
-          if (terminate) break;
+          if (terminates_[i]) break;
         }
         LOG(INFO) << "end thread.";
       });
@@ -141,9 +131,8 @@ class KafkaConsumer {
     }
   }
 
-  bool fetchBatch(int partition, std::vector<std::string>& query_messages,
+  void fetchBatch(int partition, std::vector<std::string>& query_messages,
                   std::vector<std::string>& edge_messages) {
-    bool terminate_flag = false;
     edge_messages.reserve(batch_size_per_partition_);
     // Create a consumer dispatcher
     auto consumer_ptr_ = consumer_ptrs_[partition];
@@ -185,22 +174,20 @@ class KafkaConsumer {
            const TopicPartition& topic_partition) {
           // EndOfFile process
           dispatcher.stop();
-          // terminate_flag = true;
           LOG(INFO) << "Reached EOF on partition " << topic_partition;
         },
         [&](ConsumerDispatcher::Timeout) {
           dispatcher.stop();
-          terminate_flag = true;
+          terminates_[partition] = true;
           LOG(INFO) << "Consume time out.";
         });
-    return terminate_flag;
   }
 
   template <typename T>
   using mq_t = std::shared_ptr<grape::BlockingQueue<T>>;
   std::vector<mq_t<std::vector<std::string>>> qmq_;
   std::vector<mq_t<std::vector<std::string>>> emq_;
-  std::vector<mq_t<bool>> smq_;
+  std::vector<bool> terminates_;
   std::vector<std::thread> consume_threads_;
 
   int worker_id_;
